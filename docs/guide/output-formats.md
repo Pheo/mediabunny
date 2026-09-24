@@ -69,11 +69,23 @@ type IsobmffOutputFormatOptions = {
 	fastStart?: false | 'in-memory' | 'reserve' | 'fragmented';
 	minimumFragmentDuration?: number;
 	metadataFormat?: 'mdir' | 'mdta' | 'udta' | 'auto';
+	boxInsertions?: readonly IsobmffBoxInsertion[];
 
 	onFtyp?: (data: Uint8Array, position: number) => unknown;
 	onMoov?: (data: Uint8Array, position: number) => unknown;
 	onMdat?: (data: Uint8Array, position: number) => unknown;
 	onMoof?: (data: Uint8Array, position: number, timestamp: number) => unknown;
+};
+
+type IsobmffBoxInsertion = {
+	after: {
+		type: string;
+		occurrence?: number;
+	};
+	boxes: readonly {
+		type: string;
+		contents: Uint8Array;
+	}[];
 };
 ```
 - `fastStart`\
@@ -105,6 +117,12 @@ type IsobmffOutputFormatOptions = {
 	- `'mdir'`: Write tags into `moov/udta/meta` using the 'mdir' handler format.
 	- `'mdta'`: Write tags into `moov/udta/meta` using the 'mdta' handler format, equivalent to FFmpeg's `use_metadata_tags` flag. This allows for custom keys of arbitrary length.
 	- `'udta'`: Write tags directly into `moov/udta`.
+- `boxInsertions`\
+	Inserts ordered custom top-level boxes after a selected generated top-level box. The selector's `occurrence` is the
+	zero-based occurrence among matching sibling boxes and defaults to 0. Box types must contain exactly four
+	single-byte characters, and `contents` excludes the size and type header. For `uuid` boxes, begin `contents` with
+	the 16-byte user type. The muxer calculates box sizes and includes the inserted bytes in all later sample and chunk
+	offsets. A non-empty insertion whose selector does not match a generated box causes finalization to fail.
 - `onFtyp`\
 	Will be called once the ftyp (File Type) box of the output file has been written.
 - `onMoov`\

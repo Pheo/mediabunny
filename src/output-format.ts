@@ -136,6 +136,41 @@ export abstract class OutputFormat {
  * @group Output formats
  * @public
  */
+export type IsobmffCustomBox = {
+	/** Four-character ISO BMFF box type. */
+	type: string;
+	/**
+	 * Box contents excluding the size and type header.
+	 *
+	 * For a `uuid` box, this begins with the 16-byte user type, followed by the custom payload.
+	 */
+	contents: Uint8Array;
+};
+
+/**
+ * Selects an ISOBMFF box by type and occurrence among matching sibling boxes.
+ * @group Output formats
+ * @public
+ */
+export type IsobmffBoxSelector = {
+	/** Four-character box type. */
+	type: string;
+	/** Zero-based occurrence among matching sibling boxes. Defaults to 0. */
+	occurrence?: number;
+};
+
+/**
+ * An ordered group of custom ISOBMFF boxes to insert.
+ * @group Output formats
+ * @public
+ */
+export type IsobmffBoxInsertion = {
+	/** Insert after this generated top-level box. */
+	after: IsobmffBoxSelector;
+	/** Boxes are inserted in array order. */
+	boxes: readonly IsobmffCustomBox[];
+};
+
 export type IsobmffOutputFormatOptions = {
 	/**
 	 * Controls the placement of metadata in the file. Placing metadata at the start of the file is known as "Fast
@@ -185,6 +220,13 @@ export type IsobmffOutputFormatOptions = {
 	metadataFormat?: 'auto' | 'mdir' | 'mdta' | 'udta';
 
 	/**
+	 * Custom top-level boxes inserted by the muxer.
+	 *
+	 * Each insertion group's boxes are written in declaration order after the selected generated top-level box.
+	 */
+	boxInsertions?: readonly IsobmffBoxInsertion[];
+
+	/**
 	 * Will be called once the ftyp (File Type) box of the output file has been written.
 	 *
 	 * @param data - The raw bytes.
@@ -218,6 +260,88 @@ export type IsobmffOutputFormatOptions = {
 	 * @param timestamp - The start timestamp of the fragment in seconds.
 	 */
 	onMoof?: (data: Uint8Array, position: number, timestamp: number) => unknown;
+};
+
+const MUXER_OWNED_ISOBMFF_BOX_TYPES = new Set([
+	'ftyp',
+	'styp',
+	'sidx',
+	'moov',
+	'mdat',
+	'moof',
+	'mfra',
+]);
+
+const isUnknownArray = (value: unknown): value is unknown[] => Array.isArray(value);
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+	typeof value === 'object' && value !== null
+);
+
+const validateIsobmffBoxType: (value: unknown, name: string) => asserts value is string = (value, name) => {
+	if (typeof value !== 'string' || value.length !== 4) {
+		throw new TypeError(`${name} must contain exactly four single-byte characters.`);
+	}
+
+	for (let i = 0; i < value.length; i++) {
+		if (value.charCodeAt(i) > 0xff) {
+			throw new TypeError(`${name} must contain exactly four single-byte characters.`);
+		}
+	}
+};
+
+const validateIsobmffBoxInsertions = (boxInsertions: unknown) => {
+	if (boxInsertions === undefined) {
+		return;
+	}
+	if (!isUnknownArray(boxInsertions)) {
+		throw new TypeError('options.boxInsertions, when provided, must be an array.');
+	}
+
+	for (let insertionIndex = 0; insertionIndex < boxInsertions.length; insertionIndex++) {
+		const insertion = boxInsertions[insertionIndex];
+		const insertionName = `options.boxInsertions[${insertionIndex}]`;
+
+		if (!isRecord(insertion)) {
+			throw new TypeError(`${insertionName} must be an object.`);
+		}
+		const after = insertion['after'];
+		if (!isRecord(after)) {
+			throw new TypeError(`${insertionName}.after must be an object.`);
+		}
+
+		validateIsobmffBoxType(after['type'], `${insertionName}.after.type`);
+
+		const occurrence = after['occurrence'];
+		if (
+			occurrence !== undefined
+			&& (typeof occurrence !== 'number' || !Number.isInteger(occurrence) || occurrence < 0)
+		) {
+			throw new TypeError(`${insertionName}.after.occurrence must be a non-negative integer.`);
+		}
+		const boxes = insertion['boxes'];
+		if (!isUnknownArray(boxes)) {
+			throw new TypeError(`${insertionName}.boxes must be an array.`);
+		}
+
+		for (let boxIndex = 0; boxIndex < boxes.length; boxIndex++) {
+			const customBox = boxes[boxIndex];
+			const boxName = `${insertionName}.boxes[${boxIndex}]`;
+
+			if (!isRecord(customBox)) {
+				throw new TypeError(`${boxName} must be an object.`);
+			}
+
+			const customBoxType = customBox['type'];
+			validateIsobmffBoxType(customBoxType, `${boxName}.type`);
+
+			if (MUXER_OWNED_ISOBMFF_BOX_TYPES.has(customBoxType)) {
+				throw new TypeError(`${boxName}.type must not be a muxer-owned structural box type.`);
+			}
+			if (!(customBox['contents'] instanceof Uint8Array)) {
+				throw new TypeError(`${boxName}.contents must be a Uint8Array.`);
+			}
+		}
+	}
 };
 
 /**
@@ -268,6 +392,7 @@ export abstract class IsobmffOutputFormat extends OutputFormat {
 				'options.metadataFormat, when provided, must be either \'auto\', \'mdir\', \'mdta\', or \'udta\'.',
 			);
 		}
+		validateIsobmffBoxInsertions(options.boxInsertions);
 
 		super();
 

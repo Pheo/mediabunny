@@ -26,7 +26,13 @@ import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideo
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
 import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
-import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
+import {
+	CmafOutputFormat,
+	IsobmffCustomBox,
+	IsobmffOutputFormat,
+	IsobmffOutputFormatOptions,
+	MovOutputFormat,
+} from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
@@ -217,7 +223,14 @@ export class IsobmffMuxer extends Muxer {
 	private auxBoxWriter = new IsobmffBoxWriter(this.auxWriter);
 
 	private mdat: Box | null = null;
-	private ftypSize: number | null = null;
+	private pendingMdatBoxInsertions: IsobmffCustomBox[] | null = null;
+	private reserveMoovBoxInsertions: IsobmffCustomBox[] | null = null;
+	private reserveFreeBoxInsertions: IsobmffCustomBox[] | null = null;
+	private cmafStypBoxInsertions: IsobmffCustomBox[] | null = null;
+	private cmafSidxBoxInsertions: IsobmffCustomBox[] | null = null;
+	private initialHeaderSize: number | null = null;
+	private topLevelBoxOccurrences = new WeakMap<IsobmffBoxWriter, Map<string, number>>();
+	private matchedBoxInsertionIndices = new Set<number>();
 
 	trackDatas: IsobmffTrackData[] = [];
 	private allTracksKnown = promiseWithResolvers();
@@ -245,6 +258,62 @@ export class IsobmffMuxer extends Muxer {
 			?? (format instanceof CmafOutputFormat ? Infinity : 1);
 
 		this.auxWriter.start();
+	}
+
+	private takeBoxInsertionsAfter(boxWriter: IsobmffBoxWriter, type: string) {
+		let occurrences = this.topLevelBoxOccurrences.get(boxWriter);
+		if (!occurrences) {
+			occurrences = new Map();
+			this.topLevelBoxOccurrences.set(boxWriter, occurrences);
+		}
+
+		const occurrence = occurrences.get(type) ?? 0;
+		occurrences.set(type, occurrence + 1);
+
+		const boxes: IsobmffCustomBox[] = [];
+		for (let i = 0; i < (this.formatOptions.boxInsertions?.length ?? 0); i++) {
+			const insertion = this.formatOptions.boxInsertions![i]!;
+			if (insertion.after.type === type && (insertion.after.occurrence ?? 0) === occurrence) {
+				this.matchedBoxInsertionIndices.add(i);
+				boxes.push(...insertion.boxes);
+			}
+		}
+
+		return boxes;
+	}
+
+	private measureBoxInsertions(boxWriter: IsobmffBoxWriter, boxes: readonly IsobmffCustomBox[]) {
+		let size = 0;
+		for (const customBox of boxes) {
+			size += boxWriter.measureBox({
+				type: customBox.type,
+				contents: customBox.contents,
+			});
+		}
+		return size;
+	}
+
+	private writeBoxInsertions(boxWriter: IsobmffBoxWriter, boxes: readonly IsobmffCustomBox[]) {
+		for (const customBox of boxes) {
+			boxWriter.writeBox({
+				type: customBox.type,
+				contents: customBox.contents,
+			});
+		}
+	}
+
+	private validateBoxInsertionsWereApplied() {
+		for (let i = 0; i < (this.formatOptions.boxInsertions?.length ?? 0); i++) {
+			const insertion = this.formatOptions.boxInsertions![i]!;
+			if (insertion.boxes.length === 0 || this.matchedBoxInsertionIndices.has(i)) {
+				continue;
+			}
+
+			throw new Error(
+				`options.boxInsertions[${i}].after did not match a generated top-level`
+				+ ` ${insertion.after.type} box at occurrence ${insertion.after.occurrence ?? 0}.`,
+			);
+		}
 	}
 
 	async start() {
@@ -308,7 +377,10 @@ export class IsobmffMuxer extends Muxer {
 				this.formatOptions.onFtyp(data, start);
 			}
 
-			this.ftypSize = boxWriter.writer.getPos();
+			const ftypBoxInsertions = this.takeBoxInsertionsAfter(boxWriter, 'ftyp');
+			this.writeBoxInsertions(boxWriter, ftypBoxInsertions);
+
+			this.initialHeaderSize = boxWriter.writer.getPos();
 
 			if (this.isCmaf) {
 				await this.initWriter!.flush();
@@ -339,6 +411,7 @@ export class IsobmffMuxer extends Muxer {
 				this.writer.startTrackingWrites();
 			}
 
+			this.pendingMdatBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'mdat');
 			this.mdat = mdat(true); // Reserve large size by default, can refine this when finalizing.
 			this.boxWriter.writeBox(this.mdat);
 		}
@@ -1280,12 +1353,15 @@ export class IsobmffMuxer extends Muxer {
 
 			// Write the moov box now that we have all decoder configs
 			const movieBox = moov(this);
+			const moovBoxInsertions = this.takeBoxInsertionsAfter(boxWriter, 'moov');
 			boxWriter.writeBox(movieBox);
 
 			if (this.formatOptions.onMoov) {
 				const { data, start } = boxWriter.writer.stopTrackingWrites();
 				this.formatOptions.onMoov(data, start);
 			}
+
+			this.writeBoxInsertions(boxWriter, moovBoxInsertions);
 
 			if (this.isCmaf) {
 				assert(this.initWriter);
@@ -1297,9 +1373,15 @@ export class IsobmffMuxer extends Muxer {
 				this.writer = await this.output._getRootWriter(true);
 				this.boxWriter = new IsobmffBoxWriter(this.writer);
 
+				this.cmafStypBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'styp');
+				this.cmafSidxBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'sidx');
+
 				const stypSize = this.boxWriter.measureBox(styp());
 				const sidxSize = this.boxWriter.measureBox(sidx(this, 0));
-				this.segmentHeaderSize = stypSize + sidxSize;
+				this.segmentHeaderSize = stypSize
+					+ this.measureBoxInsertions(this.boxWriter, this.cmafStypBoxInsertions)
+					+ sidxSize
+					+ this.measureBoxInsertions(this.boxWriter, this.cmafSidxBoxInsertions);
 
 				this.writer.seek(this.segmentHeaderSize); // Make room for the header to be written later
 			}
@@ -1325,8 +1407,12 @@ export class IsobmffMuxer extends Muxer {
 
 		// Create an initial moof box and measure it; we need this to know where the following mdat box will begin
 		const moofBox = moof(fragmentNumber, tracksInFragment);
+		const moofBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'moof');
+		const mdatBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'mdat');
 		const moofOffset = this.writer.getPos();
-		const mdatStartPos = moofOffset + this.boxWriter.measureBox(moofBox);
+		const mdatStartPos = moofOffset
+			+ this.boxWriter.measureBox(moofBox)
+			+ this.measureBoxInsertions(this.boxWriter, moofBoxInsertions);
 
 		let currentPos = mdatStartPos + MIN_BOX_HEADER_SIZE;
 		let fragmentStartTimestamp = Infinity;
@@ -1373,6 +1459,8 @@ export class IsobmffMuxer extends Muxer {
 			this.formatOptions.onMoof(data, start, fragmentStartTimestamp);
 		}
 
+		this.writeBoxInsertions(this.boxWriter, moofBoxInsertions);
+
 		assert(this.writer.getPos() === mdatStartPos);
 
 		if (this.formatOptions.onMdat) {
@@ -1397,6 +1485,8 @@ export class IsobmffMuxer extends Muxer {
 			const { data, start } = this.writer.stopTrackingWrites();
 			this.formatOptions.onMdat(data, start);
 		}
+
+		this.writeBoxInsertions(this.boxWriter, mdatBoxInsertions);
 
 		for (const trackData of tracksInFragment) {
 			trackData.finalizedChunks.push(trackData.currentChunk!);
@@ -1431,13 +1521,18 @@ export class IsobmffMuxer extends Muxer {
 		// We finally know all tracks, let's reserve space for the moov box
 		const moovBox = moov(this);
 		const moovSize = this.boxWriter.measureBox(moovBox);
+		this.reserveMoovBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'moov');
+		this.reserveFreeBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'free');
+		this.pendingMdatBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'mdat');
 
 		const reservedSize = moovSize
+			+ this.measureBoxInsertions(this.boxWriter, this.reserveMoovBoxInsertions)
 			+ this.computeSampleTableSizeUpperBound()
-			+ 4096; // Just a little extra headroom
+			+ 4096 // Just a little extra headroom
+			+ this.measureBoxInsertions(this.boxWriter, this.reserveFreeBoxInsertions);
 
-		assert(this.ftypSize !== null);
-		this.writer.seek(this.ftypSize + reservedSize);
+		assert(this.initialHeaderSize !== null);
+		this.writer.seek(this.initialHeaderSize + reservedSize);
 
 		if (this.formatOptions.onMdat) {
 			this.writer.startTrackingWrites();
@@ -1631,6 +1726,9 @@ export class IsobmffMuxer extends Muxer {
 		if (this.fastStart === 'in-memory') {
 			this.mdat = mdat(false);
 			let mdatSize: number;
+			const moovBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'moov');
+			const mdatBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'mdat');
+			const moovBoxInsertionsSize = this.measureBoxInsertions(this.boxWriter, moovBoxInsertions);
 
 			// We know how many chunks there are, but computing the chunk positions requires an iterative approach:
 			// In order to know where the first chunk should go, we first need to know the size of the moov box. But we
@@ -1644,7 +1742,10 @@ export class IsobmffMuxer extends Muxer {
 				const movieBox = moov(this);
 				const movieBoxSize = this.boxWriter.measureBox(movieBox);
 				mdatSize = this.boxWriter.measureBox(this.mdat);
-				let currentChunkPos = this.writer.getPos() + movieBoxSize + mdatSize;
+				let currentChunkPos = this.writer.getPos()
+					+ movieBoxSize
+					+ moovBoxInsertionsSize
+					+ mdatSize;
 
 				for (const chunk of this.finalizedChunks) {
 					chunk.offset = currentChunkPos;
@@ -1671,6 +1772,8 @@ export class IsobmffMuxer extends Muxer {
 				this.formatOptions.onMoov(data, start);
 			}
 
+			this.writeBoxInsertions(this.boxWriter, moovBoxInsertions);
+
 			if (this.formatOptions.onMdat) {
 				this.writer.startTrackingWrites();
 			}
@@ -1690,8 +1793,13 @@ export class IsobmffMuxer extends Muxer {
 				const { data, start } = this.writer.stopTrackingWrites();
 				this.formatOptions.onMdat(data, start);
 			}
+
+			this.writeBoxInsertions(this.boxWriter, mdatBoxInsertions);
 		} else if (this.isFragmented) {
 			if (this.isCmaf) {
+				assert(this.cmafStypBoxInsertions);
+				assert(this.cmafSidxBoxInsertions);
+
 				const contentSize = this.segmentHeaderSize !== null
 					? this.writer.getPos() - this.segmentHeaderSize
 					: 0;
@@ -1700,17 +1808,21 @@ export class IsobmffMuxer extends Muxer {
 
 				// Write styp and sidx to the start; we recently made space for these
 				this.boxWriter.writeBox(styp());
+				this.writeBoxInsertions(this.boxWriter, this.cmafStypBoxInsertions);
 				this.boxWriter.writeBox(sidx(this, contentSize));
+				this.writeBoxInsertions(this.boxWriter, this.cmafSidxBoxInsertions);
 			} else {
 				// Append the mfra box to the end of the file for better random access
 				const startPos = this.writer.getPos();
 				const mfraBox = mfra(this.trackDatas);
+				const mfraBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'mfra');
 				this.boxWriter.writeBox(mfraBox);
 
 				// Patch the 'size' field of the mfro box at the end of the mfra box now that we know its actual size
 				const mfraBoxSize = this.writer.getPos() - startPos;
 				this.writer.seek(this.writer.getPos() - 4);
 				this.boxWriter.writeU32(mfraBoxSize);
+				this.writeBoxInsertions(this.boxWriter, mfraBoxInsertions);
 			}
 		} else {
 			assert(this.mdat);
@@ -1727,35 +1839,53 @@ export class IsobmffMuxer extends Muxer {
 				this.formatOptions.onMdat(data, start);
 			}
 
+			assert(this.pendingMdatBoxInsertions);
+			this.writeBoxInsertions(this.boxWriter, this.pendingMdatBoxInsertions);
+
 			const movieBox = moov(this);
+			let moovBoxInsertions: IsobmffCustomBox[];
+			let freeBoxInsertions: IsobmffCustomBox[] | null = null;
 
 			if (this.fastStart === 'reserve') {
-				assert(this.ftypSize !== null);
-				this.writer.seek(this.ftypSize);
+				assert(this.initialHeaderSize !== null);
+				assert(this.reserveMoovBoxInsertions);
+				assert(this.reserveFreeBoxInsertions);
+				this.writer.seek(this.initialHeaderSize);
 
-				if (this.formatOptions.onMoov) {
-					this.writer.startTrackingWrites();
-				}
-
-				this.boxWriter.writeBox(movieBox);
-
-				// Fill the remaining space with a free box. If there are less than 8 bytes left, sucks I guess
-				const remainingSpace = this.boxWriter.offsets.get(this.mdat)! - this.writer.getPos();
-				this.boxWriter.writeBox(free(remainingSpace));
+				moovBoxInsertions = this.reserveMoovBoxInsertions;
+				freeBoxInsertions = this.reserveFreeBoxInsertions;
 			} else {
-				if (this.formatOptions.onMoov) {
-					this.writer.startTrackingWrites();
-				}
-
-				this.boxWriter.writeBox(movieBox);
+				moovBoxInsertions = this.takeBoxInsertionsAfter(this.boxWriter, 'moov');
 			}
+
+			if (this.formatOptions.onMoov) {
+				this.writer.startTrackingWrites();
+			}
+
+			this.boxWriter.writeBox(movieBox);
 
 			if (this.formatOptions.onMoov) {
 				const { data, start } = this.writer.stopTrackingWrites();
 				this.formatOptions.onMoov(data, start);
 			}
+
+			this.writeBoxInsertions(this.boxWriter, moovBoxInsertions);
+
+			if (freeBoxInsertions) {
+				const remainingSpace = this.boxWriter.offsets.get(this.mdat)! - this.writer.getPos();
+				const freeSize = remainingSpace - this.measureBoxInsertions(this.boxWriter, freeBoxInsertions);
+				if (freeSize < MIN_BOX_HEADER_SIZE) {
+					throw new Error('Internal error: Insufficient reserved space for the free box.');
+				}
+
+				const freeStart = this.writer.getPos();
+				this.boxWriter.writeBox(free(freeSize));
+				this.writer.seek(freeStart + freeSize);
+				this.writeBoxInsertions(this.boxWriter, freeBoxInsertions);
+			}
 		}
 
 		release();
+		this.validateBoxInsertionsWereApplied();
 	}
 }
