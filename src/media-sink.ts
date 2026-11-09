@@ -1853,8 +1853,8 @@ const colorAlphaMergerWorkerCode = () => {
  */
 export type VideoSinkDecoderOptions = {
 	/**
-	 * A hint that configures the hardware acceleration method of the decoder. This is best left on `'no-preference'`,
-	 * the default.
+	 * A hint that configures the hardware acceleration method of the decoder. Defaults to `'no-preference'`, except
+	 * potentially transparent VP8/VP9 tracks prefer software decoding to avoid GPU readbacks during alpha merging.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/**
@@ -1929,9 +1929,18 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
 
+		let hardwareAcceleration = this._decoderOptions.hardwareAcceleration;
+		if (
+			(hardwareAcceleration === undefined || hardwareAcceleration === 'no-preference')
+			&& (codec === 'vp8' || codec === 'vp9')
+			&& await this._track.canBeTransparent()
+		) {
+			hardwareAcceleration = 'prefer-software';
+		}
+
 		decoderConfig = {
 			...decoderConfig,
-			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
+			hardwareAcceleration,
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 
