@@ -6,6 +6,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+/// <reference types="@webgpu/types" />
+
 import { parsePcmCodec, PCM_AUDIO_CODECS, PcmAudioCodec, VideoCodec, AudioCodec, OPUS_SAMPLE_RATE } from './codec';
 import {
 	addAvcBitstreamRestriction,
@@ -1258,10 +1260,10 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 				// override if all fields are set tho.
 				colorSpace: {
 					fullRange: true,
-					// These fields are irrelevant:
 					matrix: 'bt709',
 					primaries: 'bt709',
-					transfer: 'bt709',
+					// Opacity is data: sRGB tagging prevents gamma conversion when sampling external textures.
+					transfer: this.merger.gpuEnabled ? 'iec61966-2-1' : 'bt709',
 				},
 			});
 		}
@@ -1525,14 +1527,239 @@ class VideoDecoderWrapper extends DecoderWrapper<VideoSample> {
 
 let mergerWorkerUrl: string | null = null;
 
-/** Utility class that merges together color and alpha information on the CPU in a pool of workers. */
+const createGpuColorAlphaMerger = async (signal: AbortSignal) => {
+	if (typeof navigator === 'undefined' || !navigator.gpu || typeof OffscreenCanvas === 'undefined') {
+		return null;
+	}
+
+	const adapter = await navigator.gpu.requestAdapter();
+	if (!adapter || adapter.info.isFallbackAdapter || signal.aborted) {
+		return null;
+	}
+
+	const device = await adapter.requestDevice();
+	if (signal.aborted) {
+		device.destroy();
+		return null;
+	}
+	const abort = () => device.destroy();
+	signal.addEventListener('abort', abort, { once: true });
+	try {
+		const canvas = new OffscreenCanvas(1, 1);
+		const context = canvas.getContext('webgpu');
+		if (!context) {
+			device.destroy();
+			return null;
+		}
+
+		let lost = false;
+		void device.lost.then(() => {
+			lost = true;
+		});
+
+		const format = navigator.gpu.getPreferredCanvasFormat();
+		context.configure({
+			device,
+			format,
+			alphaMode: 'premultiplied',
+			colorSpace: 'srgb',
+			usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+		});
+		const module = device.createShaderModule({
+			code: `
+				struct Vertex {
+					@builtin(position) position: vec4f,
+					@location(0) uv: vec2f,
+				}
+				@vertex fn vertex(@builtin(vertex_index) index: u32) -> Vertex {
+					let positions = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+					var result: Vertex;
+					result.position = vec4f(positions[index], 0, 1);
+					result.uv = positions[index] * vec2f(0.5, -0.5) + vec2f(0.5);
+					return result;
+				}
+				@group(0) @binding(0) var frameSampler: sampler;
+				@group(0) @binding(1) var colorTexture: texture_external;
+				@group(0) @binding(2) var alphaTexture: texture_external;
+				@fragment fn fragment(input: Vertex) -> @location(0) vec4f {
+					let color = textureSampleBaseClampToEdge(colorTexture, frameSampler, input.uv).rgb;
+					let alpha = clamp(textureSampleBaseClampToEdge(alphaTexture, frameSampler, input.uv).r, 0, 1);
+					return vec4f(clamp(color, vec3f(0), vec3f(1)) * alpha, alpha);
+				}
+			`,
+		});
+		const pipeline = await device.createRenderPipelineAsync({
+			layout: 'auto',
+			vertex: { module, entryPoint: 'vertex' },
+			fragment: { module, entryPoint: 'fragment', targets: [{ format }] },
+			primitive: { topology: 'triangle-list' },
+		});
+		if (signal.aborted) {
+			device.destroy();
+			return null;
+		}
+		const sampler = device.createSampler();
+		const popErrorScopes = () => Promise.all([
+			device.popErrorScope(), device.popErrorScope(), device.popErrorScope(),
+		]);
+
+		return {
+			merge: async (color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame | null> => {
+				const colorRect = color.visibleRect;
+				const alphaRect = alpha.visibleRect;
+				if (
+					!['I420', 'I422', 'I444', 'NV12', 'RGBA', 'RGBX', 'BGRA', 'BGRX'].includes(color.format ?? '')
+					|| !['I420', 'I422', 'I444', 'NV12'].includes(alpha.format ?? '')
+					|| color.colorSpace.primaries !== 'bt709'
+					|| !['bt709', 'iec61966-2-1'].includes(color.colorSpace.transfer ?? '')
+					|| alpha.colorSpace.primaries !== 'bt709'
+					|| alpha.colorSpace.transfer !== 'iec61966-2-1'
+					|| alpha.colorSpace.matrix !== 'bt709'
+					|| alpha.colorSpace.fullRange === null
+					|| !colorRect || !alphaRect
+					|| colorRect.x !== alphaRect.x || colorRect.y !== alphaRect.y
+					|| colorRect.width !== alphaRect.width || colorRect.height !== alphaRect.height
+					|| color.displayWidth !== alpha.displayWidth || color.displayHeight !== alpha.displayHeight
+				) {
+					return null;
+				}
+				if (lost) {
+					throw new Error('Color/alpha merge GPU device lost.');
+				}
+
+				if (canvas.width !== colorRect.width || canvas.height !== colorRect.height) {
+					canvas.width = colorRect.width;
+					canvas.height = colorRect.height;
+				}
+
+				device.pushErrorScope('internal');
+				device.pushErrorScope('out-of-memory');
+				device.pushErrorScope('validation');
+				let frame: VideoFrame | null = null;
+				try {
+					const bindGroup = device.createBindGroup({
+						layout: pipeline.getBindGroupLayout(0),
+						entries: [
+							{ binding: 0, resource: sampler },
+							{ binding: 1, resource: device.importExternalTexture({ source: color }) },
+							{ binding: 2, resource: device.importExternalTexture({ source: alpha }) },
+						],
+					});
+					const encoder = device.createCommandEncoder();
+					const pass = encoder.beginRenderPass({
+						colorAttachments: [{
+							view: context.getCurrentTexture().createView(),
+							clearValue: [0, 0, 0, 0],
+							loadOp: 'clear',
+							storeOp: 'store',
+						}],
+					});
+					pass.setPipeline(pipeline);
+					pass.setBindGroup(0, bindGroup);
+					pass.draw(3);
+					pass.end();
+					device.queue.submit([encoder.finish()]);
+
+					// Snapshot before yielding: the canvas can be presented/cleared at the next task.
+					frame = new VideoFrame(canvas, {
+						timestamp: color.timestamp,
+						duration: color.duration ?? undefined,
+						displayWidth: color.displayWidth,
+						displayHeight: color.displayHeight,
+					});
+				} catch (error) {
+					await popErrorScopes();
+					throw error;
+				}
+
+				try {
+					const error = (await popErrorScopes()).find(error => error !== null);
+					if (error || lost) {
+						throw new Error(error?.message ?? 'Color/alpha merge GPU device lost.');
+					}
+					await device.queue.onSubmittedWorkDone();
+					return frame;
+				} catch (error) {
+					frame.close();
+					throw error;
+				}
+			},
+			close: () => {
+				context.unconfigure();
+				device.destroy();
+			},
+		};
+	} catch (error) {
+		device.destroy();
+		throw error;
+	} finally {
+		signal.removeEventListener('abort', abort);
+	}
+};
+
+/** Utility class that merges color and alpha on the GPU, falling back to a CPU worker pool. */
 export class ColorAlphaMerger {
 	private workers: Worker[] = [];
 	private nextWorkerIndex = 0;
 	private pendingRequests = new Map<number, ReturnType<typeof promiseWithResolvers<VideoFrame>>>();
 	private nextRequestId = 0;
+	private gpu: Awaited<ReturnType<typeof createGpuColorAlphaMerger>> = null;
+	private gpuInitialization: Promise<void> | null = null;
+	private gpuInitializationAbort = new AbortController();
+	private closed = false;
 
-	merge(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
+	get gpuEnabled() {
+		return this.gpu !== null;
+	}
+
+	async initializeGpu() {
+		this.gpuInitialization ??= (async () => {
+			const initialization = createGpuColorAlphaMerger(this.gpuInitializationAbort.signal).catch(() => null);
+			let timeout: ReturnType<typeof setTimeout>;
+			const gpu = await Promise.race([
+				initialization,
+				new Promise<null>((resolve) => {
+					timeout = setTimeout(() => resolve(null), 1000);
+				}),
+			]);
+			clearTimeout(timeout!);
+			if (this.closed || !gpu) {
+				// A backgrounded browser may defer WebGPU initialization until much later.
+				this.gpuInitializationAbort.abort();
+				void initialization.then(gpu => gpu?.close());
+			} else {
+				this.gpu = gpu;
+			}
+		})();
+		await this.gpuInitialization;
+		return this.gpu !== null;
+	}
+
+	async merge(color: VideoFrame, alpha: VideoFrame): Promise<VideoFrame> {
+		if (this.gpu) {
+			try {
+				const frame = await this.gpu.merge(color, alpha);
+				if (frame) {
+					color.close();
+					alpha.close();
+					if (this.closed) {
+						frame.close();
+						throw new Error('Color/alpha merger closed.');
+					}
+					return frame;
+				}
+			} catch {
+				this.gpu?.close();
+				this.gpu = null;
+			}
+		}
+
+		if (this.closed) {
+			color.close();
+			alpha.close();
+			throw new Error('Color/alpha merger closed.');
+		}
+
 		if (this.workers.length === 0) {
 			if (!mergerWorkerUrl) {
 				const blob = new Blob(
@@ -1586,6 +1813,11 @@ export class ColorAlphaMerger {
 	}
 
 	close() {
+		this.closed = true;
+		this.gpuInitializationAbort.abort();
+		this.gpu?.close();
+		this.gpu = null;
+
 		for (const worker of this.workers) {
 			worker.terminate();
 		}
@@ -1854,7 +2086,7 @@ const colorAlphaMergerWorkerCode = () => {
 export type VideoSinkDecoderOptions = {
 	/**
 	 * A hint that configures the hardware acceleration method of the decoder. Defaults to `'no-preference'`, except
-	 * potentially transparent VP8/VP9 tracks prefer software decoding to avoid GPU readbacks during alpha merging.
+	 * potentially transparent VP8/VP9 tracks prefer software decoding when GPU alpha merging is unavailable.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/**
@@ -1929,11 +2161,26 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 		const timeResolution = await this._track.getTimeResolution();
 		assert(codec && decoderConfig);
 
+		const transparentVpx = (codec === 'vp8' || codec === 'vp9') && await this._track.canBeTransparent();
+		let merger: ColorAlphaMerger | null = null;
+		if (
+			transparentVpx
+			&& customVideoDecoders.length === 0
+			&& (codec === 'vp8' || /^vp09\.\d{2}\.\d{2}\.08(?:\.|$)/.test(decoderConfig.codec))
+			&& !(await this._track.hasHighDynamicRange())
+		) {
+			merger = new ColorAlphaMerger();
+			if (!(await merger.initializeGpu())) {
+				merger.close();
+				merger = null;
+			}
+		}
+
 		let hardwareAcceleration = this._decoderOptions.hardwareAcceleration;
 		if (
 			(hardwareAcceleration === undefined || hardwareAcceleration === 'no-preference')
-			&& (codec === 'vp8' || codec === 'vp9')
-			&& await this._track.canBeTransparent()
+			&& transparentVpx
+			&& !merger
 		) {
 			// Prefer CPU frames for alpha merging: Chromium's copyTo() can synchronously read back GPU textures.
 			// https://crsrc.org/c/third_party/blink/renderer/modules/webcodecs/video_frame.cc;l=1504
@@ -1946,7 +2193,20 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 
-		return new VideoDecoderWrapper(onSample, onError, codec, decoderConfig, rotation, flip, timeResolution);
+		try {
+			const decoder = new VideoDecoderWrapper(
+				onSample, onError, codec, decoderConfig, rotation, flip, timeResolution,
+			);
+			if (decoder.customDecoder) {
+				merger?.close();
+			} else {
+				decoder.merger = merger;
+			}
+			return decoder;
+		} catch (error) {
+			merger?.close();
+			throw error;
+		}
 	}
 
 	/** @internal */
