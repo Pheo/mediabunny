@@ -1935,6 +1935,8 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 			&& (codec === 'vp8' || codec === 'vp9')
 			&& await this._track.canBeTransparent()
 		) {
+			// Prefer CPU frames for alpha merging: Chromium's copyTo() can synchronously read back GPU textures.
+			// https://crsrc.org/c/third_party/blink/renderer/modules/webcodecs/video_frame.cc;l=1504
 			hardwareAcceleration = 'prefer-software';
 		}
 
