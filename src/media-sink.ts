@@ -1854,7 +1854,8 @@ const colorAlphaMergerWorkerCode = () => {
 export type VideoSinkDecoderOptions = {
 	/**
 	 * A hint that configures the hardware acceleration method of the decoder. This is best left on `'no-preference'`,
-	 * the default.
+	 * the default. Tracks that may contain transparency always use `'prefer-software'` to avoid expensive GPU readbacks
+	 * during alpha merging.
 	 */
 	hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 	/**
@@ -1931,7 +1932,10 @@ export class VideoSampleSink extends BaseMediaSampleSink<VideoSample> {
 
 		decoderConfig = {
 			...decoderConfig,
-			hardwareAcceleration: this._decoderOptions.hardwareAcceleration,
+			// Alpha merging copies both color and alpha frames to CPU memory, so avoid expensive GPU readbacks.
+			hardwareAcceleration: await this._track.canBeTransparent()
+				? 'prefer-software'
+				: this._decoderOptions.hardwareAcceleration,
 			optimizeForLatency: this._decoderOptions.optimizeForLatency,
 		};
 

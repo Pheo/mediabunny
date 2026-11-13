@@ -1,4 +1,4 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
@@ -11,6 +11,26 @@ import { Conversion } from '../../src/conversion.js';
 import { AudioSample, AudioSampleCopyToOptions } from '../../src/sample.js';
 import { OPUS_PRE_ROLL_DURATION } from '../../src/codec.js';
 import { InputAudioTrack } from '../../src/input-track.js';
+
+test.each([undefined, 'no-preference', 'prefer-hardware', 'prefer-software'] as const)(
+	'Opaque video preserves the decoder hardware acceleration preference (%s)',
+	async (hardwareAcceleration) => {
+		using input = new Input({
+			source: new UrlSource('/demo.webm'),
+			formats: ALL_FORMATS,
+		});
+
+		const track = (await input.getPrimaryVideoTrack())!;
+		expect(await track.canBeTransparent()).toBe(false);
+
+		const configure = vi.spyOn(VideoDecoder.prototype, 'configure').mockImplementation(() => {});
+		const sink = new VideoSampleSink(track, { hardwareAcceleration });
+		const decoder = await sink._createDecoder(() => {}, () => {});
+		decoder.close();
+
+		expect(configure).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ hardwareAcceleration }));
+	},
+);
 
 // https://github.com/Vanilagy/mediabunny/issues/370
 test('Negative audio timestamps are preserved', async () => {

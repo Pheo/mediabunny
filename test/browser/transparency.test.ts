@@ -1,8 +1,8 @@
-import { expect, test } from 'vitest';
+import { expect, test, vi } from 'vitest';
 import { Input } from '../../src/input.js';
 import { BufferSource, UrlSource } from '../../src/source.js';
 import { ALL_FORMATS } from '../../src/input-format.js';
-import { CanvasSink, EncodedPacketSink, VideoSampleSink } from '../../src/media-sink.js';
+import { CanvasSink, EncodedPacketSink, VideoSampleSink, VideoSinkDecoderOptions } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { WebMOutputFormat } from '../../src/output-format.js';
 import { BufferTarget } from '../../src/target.js';
@@ -11,7 +11,7 @@ import { canEncodeVideo, Quality } from '../../src/encode.js';
 import { VideoSample } from '../../src/sample.js';
 import { Conversion } from '../../src/conversion.js';
 
-const decodeTransparentVideoTest = async () => {
+const decodeTransparentVideoTest = async (decoderOptions: VideoSinkDecoderOptions = {}) => {
 	using input = new Input({
 		source: new UrlSource('/transparency.webm'),
 		formats: ALL_FORMATS,
@@ -20,7 +20,7 @@ const decodeTransparentVideoTest = async () => {
 	const videoTrack = (await input.getPrimaryVideoTrack())!;
 	expect(await videoTrack.canBeTransparent()).toBe(true);
 
-	const sink = new VideoSampleSink(videoTrack);
+	const sink = new VideoSampleSink(videoTrack, decoderOptions);
 	using sample = (await sink.getSample(0.5))!;
 
 	expect(sample.format).toContain('A'); // Probably RGBA
@@ -35,9 +35,18 @@ const decodeTransparentVideoTest = async () => {
 	expect(imageData.data[3]).toBeLessThan(255); // Check that there's actually transparent pixels
 };
 
-test('Can decode transparent video', async () => {
-	await decodeTransparentVideoTest();
-});
+test.each([undefined, 'no-preference', 'prefer-hardware', 'prefer-software'] as const)(
+	'Can decode transparent video using software decoders (requested: %s)',
+	async (hardwareAcceleration) => {
+		const configure = vi.spyOn(VideoDecoder.prototype, 'configure');
+		await decodeTransparentVideoTest({ hardwareAcceleration });
+
+		expect(configure).toHaveBeenCalledTimes(2);
+		for (const [config] of configure.mock.calls) {
+			expect(config.hardwareAcceleration).toBe('prefer-software');
+		}
+	},
+);
 
 test('Can decode faulty transparent video and behaves gracefully', async () => {
 	using input = new Input({
